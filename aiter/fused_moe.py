@@ -154,8 +154,14 @@ def _moe_sorting_impl(
 
 
 def _flydsl_moe_sorting(
-    topk_ids, topk_weights, num_experts, model_dim,
-    moebuf_dtype, block_size, expert_mask, num_local_tokens,
+    topk_ids,
+    topk_weights,
+    num_experts,
+    model_dim,
+    moebuf_dtype,
+    block_size,
+    expert_mask,
+    num_local_tokens,
 ):
     """FlyDSL sorting dispatch — called outside torch_compile_guard."""
     from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_fwd
@@ -173,11 +179,17 @@ def _flydsl_moe_sorting(
     moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
     flydsl_moe_sorting_fwd(
-        topk_ids, topk_weights,
-        sorted_ids, sorted_weights, sorted_expert_ids,
-        num_valid_ids, moe_buf,
-        num_experts, int(block_size),
-        expert_mask, num_local_tokens,
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        num_experts,
+        int(block_size),
+        expert_mask,
+        num_local_tokens,
     )
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
@@ -198,8 +210,14 @@ def moe_sorting(
 ):
     if _USE_FLYDSL_MOE_SORTING:
         return _flydsl_moe_sorting(
-            topk_ids, topk_weights, num_experts, model_dim,
-            moebuf_dtype, block_size, expert_mask, num_local_tokens,
+            topk_ids,
+            topk_weights,
+            num_experts,
+            model_dim,
+            moebuf_dtype,
+            block_size,
+            expert_mask,
+            num_local_tokens,
         )
     # FLAT kernel: in-kernel routing (manifest flat=1); pass through unsorted topk.
     if flat:
