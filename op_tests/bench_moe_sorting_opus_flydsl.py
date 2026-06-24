@@ -11,27 +11,42 @@ vs the CPU reference; FlyDSL is also checked directly vs OPUS.
 
 Run from the aiter repo root on a GPU node, e.g. inside atom_bench:
   cd /path/to/aiter
+  export PYTHONPATH=/workspace/aiter:$PYTHONPATH
   FLYDSL_RUNTIME_ENABLE_CACHE=0 HIP_VISIBLE_DEVICES=0 \\
     python op_tests/bench_moe_sorting_opus_flydsl.py
+
+Timing modes (--timing):
+  micro  — direct kernel calls; CUDA graph (T<=256) or events (T>256) [default]
+  kineto — moe_sorting() dispatch + PyTorch profiler (aiter run_perftest style);
+           set AITER_LOG_MORE=1 for the per-kernel table in logs
 
 Optional flags:
   --configs dsv4 gptoss   # subset of model configs (default: both)
   --skip-check            # skip correctness checks (timing only)
+  --kineto-detail         # print per-kernel device_time_avg (kineto mode only)
+  --kineto-iters N        # profiler iterations (default: 101, same as run_perftest)
+  --kineto-warmup N       # warmup iterations before profile (default: 2)
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import os
+import re
 import sys
 
 os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
 
+import pandas as pd
 import torch
+import torch.profiler as tpf
 
 import aiter
+import aiter.fused_moe as fm
 from aiter import dtypes
-from aiter.test_common import checkAllclose
+from aiter.fused_moe import fused_topk, moe_sorting
+from aiter.test_common import checkAllclose, post_process_data, run_iters, run_iters_rotate
 from aiter.ops.flydsl.kernels.moe_sorting_kernel import (
     moe_sorting_flydsl,
     moe_sorting_get_workspace_size,
@@ -50,11 +65,29 @@ CONFIGS = {
 }
 
 BLOCK_SIZE_M = 32
+SORT_KERNEL_RE = re.compile(
+    r"moe.?sort|sorting|opus|flydsl|p0v2|p23|decode|scatter|multiphase|clear.?ws|clear_workspace",
+    re.IGNORECASE,
+)
 
 NativeOutputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 SortingOutputs = tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]
+
+
+def set_moe_sorting_backend(backend: str) -> None:
+    """Mirror op_tests/test_moe_sorting.py backend selection."""
+    if backend == "flydsl":
+        if not is_flydsl_available():
+            raise RuntimeError("backend=flydsl requested but FlyDSL is not available")
+        fm._USE_CK_MOE_SORTING = False
+        fm._USE_OPUS_MOE_SORTING = False
+    elif backend == "opus":
+        fm._USE_CK_MOE_SORTING = False
+        fm._USE_OPUS_MOE_SORTING = True
+    else:
+        raise ValueError(f"unknown backend for bench: {backend}")
 
 
 def moe_sorting_native(
@@ -114,12 +147,19 @@ def moe_sorting_native(
     return sorted_ids, sorted_weights, sorted_expert_ids, num_tokens_post_pad
 
 
-def make_unique_ids(m: int, topk: int, num_experts: int, device: torch.device) -> torch.Tensor:
-    ids = torch.zeros(m, topk, dtype=torch.int32, device=device)
-    for t in range(m):
-        perm = torch.randperm(num_experts, device=device)[:topk]
-        ids[t] = perm.to(torch.int32)
-    return ids
+def make_sorting_inputs(
+    m: int,
+    num_experts: int,
+    topk: int,
+    model_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+):
+    """Same input path as op_tests/test_moe_sorting.py (fused_topk on random scores)."""
+    inp = torch.randn((m, model_dim), dtype=dtype, device=device)
+    score = torch.rand((m, num_experts), device=device, dtype=dtype)
+    topk_weights, topk_ids = fused_topk(inp, score, topk, True)
+    return topk_ids, topk_weights
 
 
 def alloc_outputs(
@@ -136,7 +176,132 @@ def alloc_outputs(
     )
 
 
-def _bench(run_fn, use_graph: bool) -> float:
+def get_trace_perf_table(prof, num_iters: int) -> tuple[float, pd.DataFrame]:
+    """Same aggregation as aiter.test_common.get_trace_perf, but returns the table too."""
+    assert num_iters > 1
+    warm_iter = 1
+    num_iters -= warm_iter
+    rows = []
+    cols = [
+        "name",
+        "self_cpu_time_total",
+        "self_device_time_total",
+        "device_type",
+        "device_index",
+    ]
+    for el in prof.events():
+        rows.append([getattr(el, x, None) for x in cols])
+    df = pd.DataFrame(rows, columns=cols)
+    dropped_indexs, dropped_num = post_process_data(df, num_iters + warm_iter, warm_iter)
+    df = df.drop(dropped_indexs)
+    iter_init = 0
+    df["cnt"] = 1
+    rets = []
+    for name, d in df.groupby("name", sort=False):
+        kernel_num_per_iter = iter_init
+        if str(d["device_type"].iat[0]).split(".")[-1] != "CUDA":
+            kernel_num_per_iter = 1
+        r = d.iloc[kernel_num_per_iter:][
+            ["cnt", "self_cpu_time_total", "self_device_time_total"]
+        ].sum()
+        if not r.empty:
+            device_type = str(d["device_type"].iat[0]).split(".")[-1]
+            r["name"] = name
+            r["device_type"] = device_type
+            r["device_index"] = str(d["device_index"].iat[0])
+            if device_type == "CUDA":
+                r["device_time_sum"] = r["self_device_time_total"]
+                r["host_time_sum"] = 0
+            else:
+                r["host_time_sum"] = r["self_device_time_total"]
+                r["device_time_sum"] = 0
+            r["device_time_avg"] = (
+                r["device_time_sum"] / r["cnt"] if r["cnt"] > 0 else 0
+            )
+        rets.append(r)
+    df = pd.DataFrame(rets)
+    out_cols = [
+        "name",
+        "cnt",
+        "host_time_sum",
+        "device_time_sum",
+        "device_time_avg",
+        "device_type",
+        "device_index",
+    ]
+    out_cols = [el for el in out_cols if el in df.columns]
+    df = df[(df.host_time_sum > 0) | (df.device_time_sum > 0)]
+    df = df[out_cols].sort_values(["host_time_sum", "device_time_sum"], ignore_index=True)
+    actual_iters = num_iters + warm_iter - dropped_num
+    avg_name = "[avg us/iter]"
+    for el in ["host_time_sum", "device_time_sum"]:
+        if el == "host_time_sum":
+            df.at[avg_name, el] = df[el].sum() / num_iters
+        else:
+            df.at[avg_name, el] = df[el].sum() / actual_iters
+    total_us = float(df.at[avg_name, "device_time_sum"])
+    return total_us, df
+
+
+def _print_kineto_sort_kernels(df: pd.DataFrame, backend: str, m: int) -> None:
+    cuda = df[(df["device_type"] == "CUDA") & (df["name"] != "[avg us/iter]")]
+    hits = cuda[cuda["name"].astype(str).str.contains(SORT_KERNEL_RE, regex=True)]
+    if hits.empty:
+        hits = cuda
+    print(f"    kineto kernels ({backend}, T={m}):")
+    for _, row in hits.iterrows():
+        print(f"      {row['device_time_avg']:8.1f} us  {row['name']}")
+
+
+def bench_kineto_moe_sorting(
+    backend: str,
+    topk_ids,
+    topk_weights,
+    num_experts: int,
+    model_dim: int,
+    dtype: torch.dtype,
+    unit_size: int,
+    *,
+    num_iters: int,
+    num_warmup: int,
+    show_detail: bool,
+) -> float:
+    """Profile moe_sorting() via kineto (aiter run_perftest / AITER_LOG_MORE pattern)."""
+    set_moe_sorting_backend(backend)
+    args = (
+        topk_ids,
+        topk_weights,
+        num_experts,
+        model_dim,
+        dtype,
+        unit_size,
+        None,
+        None,
+        0,
+    )
+    rotate_args = [(copy.deepcopy(args), {}) for _ in range(num_iters - 1)] + [(args, {})]
+    run_iters(num_warmup, moe_sorting, *args)
+    torch.cuda.synchronize()
+    with tpf.profile(
+        activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
+        profile_memory=False,
+        with_stack=False,
+        with_modules=True,
+    ) as prof:
+        run_iters_rotate(num_iters, moe_sorting, rotate_args)
+        torch.cuda.synchronize()
+    total_us, df = get_trace_perf_table(prof, num_iters)
+    if int(os.environ.get("AITER_LOG_MORE", 0)):
+        pd.set_option("display.expand_frame_repr", False)
+        pd.set_option("display.max_colwidth", 90)
+        pd.set_option("display.float_format", "{:,.1f}".format)
+        aiter.logger.info("%s kineto trace (T=%d):\n%s", backend, topk_ids.shape[0], df)
+    if show_detail:
+        _print_kineto_sort_kernels(df, backend, topk_ids.shape[0])
+    return total_us
+
+
+def _bench_micro(run_fn, use_graph: bool) -> float:
     if use_graph:
         for _ in range(WARMUP):
             run_fn()
@@ -190,7 +355,7 @@ def run_flydsl(ids, weights, num_experts, unit_size, m, topk, model_dim, device)
     return si, sw, se, nv, mb
 
 
-def bench_opus(ids, weights, num_experts, unit_size, m, topk, model_dim, device, use_graph):
+def bench_opus_micro(ids, weights, num_experts, unit_size, m, topk, model_dim, device, use_graph):
     si, sw, se, nv, mb = alloc_outputs(m, topk, num_experts, unit_size, model_dim, device)
     wsz = aiter.moe_sorting_opus_get_workspace_size(m, num_experts, topk, 0)
     ws = torch.empty(wsz, dtype=torch.uint8, device=device) if wsz > 0 else None
@@ -200,10 +365,10 @@ def bench_opus(ids, weights, num_experts, unit_size, m, topk, model_dim, device,
             ids, weights, si, sw, se, nv, mb, num_experts, unit_size, None, None, ws, 0
         )
 
-    return _bench(_run, use_graph)
+    return _bench_micro(_run, use_graph)
 
 
-def bench_flydsl(ids, weights, num_experts, unit_size, m, topk, model_dim, device, use_graph):
+def bench_flydsl_micro(ids, weights, num_experts, unit_size, m, topk, model_dim, device, use_graph):
     si, sw, se, nv, mb = alloc_outputs(m, topk, num_experts, unit_size, model_dim, device)
     wsz = moe_sorting_get_workspace_size(m, num_experts, topk, unit_size)
     ws = torch.empty(wsz, dtype=torch.int32, device=device) if wsz > 0 else None
@@ -213,7 +378,7 @@ def bench_flydsl(ids, weights, num_experts, unit_size, m, topk, model_dim, devic
             ids, weights, si, sw, se, nv, mb, num_experts, unit_size, None, None, ws
         )
 
-    return _bench(_run, use_graph)
+    return _bench_micro(_run, use_graph)
 
 
 def verify_against_native(
@@ -224,17 +389,12 @@ def verify_against_native(
     m: int,
     backend_name: str,
 ) -> None:
-    """Same field masks and tolerances as op_tests/test_moe_sorting.py."""
     ref_ids, ref_weights, ref_expert_ids, ref_nv = native_out
     gpu_ids, gpu_weights, gpu_expert_ids, gpu_nv, _ = gpu_out
 
     errs: dict[str, float] = {}
     errs["num_tokens_post_padded"] = checkAllclose(
-        ref_nv,
-        gpu_nv,
-        atol=0,
-        msg=f"{backend_name} num_tokens_post_padded",
-        printLog=False,
+        ref_nv, gpu_nv, atol=0, msg=f"{backend_name} num_tokens_post_padded", printLog=False
     )
     weight_mask = ref_ids != (topk << 24 | m)
     num_tokens_post_pad = ref_nv[0].item()
@@ -275,7 +435,6 @@ def verify_gpu_pair(
     ref_name: str,
     cand_name: str,
 ) -> None:
-    """Direct GPU-vs-GPU check using masks from the CPU reference."""
     native_ids, native_weights, native_expert_ids, native_nv = native_out
     ref_ids, ref_weights, ref_expert_ids, ref_nv, _ = ref_out
     cand_ids, cand_weights, cand_expert_ids, cand_nv, _ = cand_out
@@ -323,7 +482,6 @@ def verify_correctness(
     model_dim,
     device,
 ) -> None:
-    """Run CPU reference + OPUS/FlyDSL; each checked vs CPU, FlyDSL vs OPUS."""
     native_out = moe_sorting_native(ids, weights, num_experts, unit_size)
     opus_out = run_opus(ids, weights, num_experts, unit_size, m, topk, model_dim, device)
     flydsl_out = run_flydsl(ids, weights, num_experts, unit_size, m, topk, model_dim, device)
@@ -345,11 +503,28 @@ def main() -> int:
         help="model configs to benchmark (default: all)",
     )
     parser.add_argument(
+        "--timing",
+        choices=["micro", "kineto"],
+        default="micro",
+        help="micro=direct kernel CUDA graph/events; kineto=moe_sorting()+profiler",
+    )
+    parser.add_argument(
         "--skip-check",
         action="store_true",
         help="skip correctness checks and run timing only",
     )
+    parser.add_argument(
+        "--kineto-detail",
+        action="store_true",
+        help="print per-kernel device_time_avg breakdown (kineto mode only)",
+    )
+    parser.add_argument("--kineto-iters", type=int, default=101, help="profiler iterations")
+    parser.add_argument("--kineto-warmup", type=int, default=2, help="warmup before profile")
     args = parser.parse_args()
+
+    if args.kineto_iters < 2:
+        print("--kineto-iters must be >= 2", file=sys.stderr)
+        return 1
 
     if not is_flydsl_available():
         print("FlyDSL is not available in this build; cannot benchmark FlyDSL path.", file=sys.stderr)
@@ -359,17 +534,26 @@ def main() -> int:
         print("CUDA is required.", file=sys.stderr)
         return 1
 
+    if args.timing == "kineto":
+        os.environ["AITER_LOG_MORE"] = os.environ.get("AITER_LOG_MORE", "1")
+
+    dtype = dtypes.d_dtypes["bf16"]
     device = torch.device("cuda:0")
     torch.cuda.set_device(0)
 
     print("=" * 80)
     print("  MoE Sorting UT Benchmark — OPUS vs FlyDSL")
-    print(f"  Decode (T<=256): CUDA graph, {GRAPH_REPLAY} replays")
-    print(f"  Prefill (T>256): CUDA events, {BENCH} iterations")
+    if args.timing == "micro":
+        print(f"  Timing: micro — graph T<=256 ({GRAPH_REPLAY} replays), events T>256 ({BENCH} iters)")
+    else:
+        print(
+            f"  Timing: kineto — moe_sorting() + profiler "
+            f"({args.kineto_warmup} warmup, {args.kineto_iters} iters, AITER_LOG_MORE=1)"
+        )
     if args.skip_check:
         print("  Correctness: SKIPPED (--skip-check)")
     else:
-        print("  Correctness: OPUS + FlyDSL vs CPU; FlyDSL vs OPUS")
+        print("  Correctness: OPUS + FlyDSL vs CPU; FlyDSL vs OPUS (direct kernel fwd)")
     print("=" * 80)
 
     for key in args.configs:
@@ -389,10 +573,9 @@ def main() -> int:
         n_ok = 0
         for m in T_ALL:
             torch.manual_seed(42)
-            ids = make_unique_ids(m, topk, num_experts, device)
-            weights = torch.rand(m, topk, device=device, dtype=torch.float32)
-            use_graph = m <= 256
-            path = "graph" if use_graph else "eager"
+            ids, weights = make_sorting_inputs(m, num_experts, topk, model_dim, dtype, device)
+            use_graph = args.timing == "micro" and m <= 256
+            path = "graph" if use_graph else ("kineto" if args.timing == "kineto" else "eager")
 
             check_status = "ok"
             if not args.skip_check:
@@ -402,22 +585,49 @@ def main() -> int:
                     )
                     n_ok += 1
                 except Exception as exc:
-                    check_status = "FAIL"
                     print(f"  correctness failed at T={m}: {exc}", file=sys.stderr)
                     return 1
 
             try:
-                t_op = bench_opus(
-                    ids, weights, num_experts, unit_size, m, topk, model_dim, device, use_graph
-                )
+                if args.timing == "kineto":
+                    t_op = bench_kineto_moe_sorting(
+                        "opus",
+                        ids,
+                        weights,
+                        num_experts,
+                        model_dim,
+                        dtype,
+                        unit_size,
+                        num_iters=args.kineto_iters,
+                        num_warmup=args.kineto_warmup,
+                        show_detail=args.kineto_detail,
+                    )
+                else:
+                    t_op = bench_opus_micro(
+                        ids, weights, num_experts, unit_size, m, topk, model_dim, device, use_graph
+                    )
             except Exception as exc:
                 print(f"  OPUS failed at T={m}: {exc}", file=sys.stderr)
                 t_op = None
 
             try:
-                t_fl = bench_flydsl(
-                    ids, weights, num_experts, unit_size, m, topk, model_dim, device, use_graph
-                )
+                if args.timing == "kineto":
+                    t_fl = bench_kineto_moe_sorting(
+                        "flydsl",
+                        ids,
+                        weights,
+                        num_experts,
+                        model_dim,
+                        dtype,
+                        unit_size,
+                        num_iters=args.kineto_iters,
+                        num_warmup=args.kineto_warmup,
+                        show_detail=args.kineto_detail,
+                    )
+                else:
+                    t_fl = bench_flydsl_micro(
+                        ids, weights, num_experts, unit_size, m, topk, model_dim, device, use_graph
+                    )
             except Exception as exc:
                 print(f"  FlyDSL failed at T={m}: {exc}", file=sys.stderr)
                 t_fl = None
