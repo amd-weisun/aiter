@@ -6,9 +6,8 @@
 Temporary script for PR review (prepare branch only). Sweeps token counts
 1..16384 for production configs requested by reviewers (DeepSeek-V4, GPT-OSS).
 
-Before timing each (config, T) point, runs all backends once. OPUS and FlyDSL
-are each checked vs the CPU reference and FlyDSL is checked directly vs OPUS.
-CK is checked vs CPU only (CK vs OPUS bitwise match is not required).
+Before timing each (config, T) point, runs OPUS and FlyDSL once. Each is checked
+vs the CPU reference; FlyDSL is also checked directly vs OPUS.
 
 Run from the aiter repo root on a GPU node, e.g. inside atom_bench:
   cd /path/to/aiter
@@ -18,7 +17,6 @@ Run from the aiter repo root on a GPU node, e.g. inside atom_bench:
 Optional flags:
   --configs dsv4 gptoss   # subset of model configs (default: both)
   --skip-check            # skip correctness checks (timing only)
-  --no-ck                 # skip CK timing column (correctness still uses CK unless --skip-check)
 """
 
 from __future__ import annotations
@@ -192,12 +190,6 @@ def run_flydsl(ids, weights, num_experts, unit_size, m, topk, model_dim, device)
     return si, sw, se, nv, mb
 
 
-def run_ck(ids, weights, num_experts, unit_size, m, topk, model_dim, device):
-    si, sw, se, nv, mb = alloc_outputs(m, topk, num_experts, unit_size, model_dim, device)
-    aiter.moe_sorting_fwd(ids, weights, si, sw, se, nv, mb, num_experts, unit_size, None, None, 0)
-    return si, sw, se, nv, mb
-
-
 def bench_opus(ids, weights, num_experts, unit_size, m, topk, model_dim, device, use_graph):
     si, sw, se, nv, mb = alloc_outputs(m, topk, num_experts, unit_size, model_dim, device)
     wsz = aiter.moe_sorting_opus_get_workspace_size(m, num_experts, topk, 0)
@@ -219,17 +211,6 @@ def bench_flydsl(ids, weights, num_experts, unit_size, m, topk, model_dim, devic
     def _run():
         moe_sorting_flydsl(
             ids, weights, si, sw, se, nv, mb, num_experts, unit_size, None, None, ws
-        )
-
-    return _bench(_run, use_graph)
-
-
-def bench_ck(ids, weights, num_experts, unit_size, m, topk, model_dim, device, use_graph):
-    si, sw, se, nv, mb = alloc_outputs(m, topk, num_experts, unit_size, model_dim, device)
-
-    def _run():
-        aiter.moe_sorting_fwd(
-            ids, weights, si, sw, se, nv, mb, num_experts, unit_size, None, None, 0
         )
 
     return _bench(_run, use_graph)
@@ -341,10 +322,8 @@ def verify_correctness(
     topk,
     model_dim,
     device,
-    *,
-    check_ck: bool,
 ) -> None:
-    """Run CPU reference + GPU backends; each GPU backend checked vs CPU."""
+    """Run CPU reference + OPUS/FlyDSL; each checked vs CPU, FlyDSL vs OPUS."""
     native_out = moe_sorting_native(ids, weights, num_experts, unit_size)
     opus_out = run_opus(ids, weights, num_experts, unit_size, m, topk, model_dim, device)
     flydsl_out = run_flydsl(ids, weights, num_experts, unit_size, m, topk, model_dim, device)
@@ -354,10 +333,6 @@ def verify_correctness(
     verify_gpu_pair(
         opus_out, flydsl_out, native_out, topk=topk, m=m, ref_name="OPUS", cand_name="FlyDSL"
     )
-
-    if check_ck:
-        ck_out = run_ck(ids, weights, num_experts, unit_size, m, topk, model_dim, device)
-        verify_against_native(native_out, ck_out, topk=topk, m=m, backend_name="CK")
 
 
 def main() -> int:
@@ -374,7 +349,6 @@ def main() -> int:
         action="store_true",
         help="skip correctness checks and run timing only",
     )
-    parser.add_argument("--no-ck", action="store_true", help="skip CK timing column")
     args = parser.parse_args()
 
     if not is_flydsl_available():
@@ -388,32 +362,26 @@ def main() -> int:
     device = torch.device("cuda:0")
     torch.cuda.set_device(0)
 
-    print("=" * 95)
+    print("=" * 80)
     print("  MoE Sorting UT Benchmark — OPUS vs FlyDSL")
     print(f"  Decode (T<=256): CUDA graph, {GRAPH_REPLAY} replays")
     print(f"  Prefill (T>256): CUDA events, {BENCH} iterations")
     if args.skip_check:
         print("  Correctness: SKIPPED (--skip-check)")
     else:
-        print("  Correctness: OPUS + FlyDSL vs CPU; FlyDSL vs OPUS; CK vs CPU")
-    print("=" * 95)
-
-    include_ck = not args.no_ck
+        print("  Correctness: OPUS + FlyDSL vs CPU; FlyDSL vs OPUS")
+    print("=" * 80)
 
     for key in args.configs:
         name, num_experts, topk, unit_size, model_dim = CONFIGS[key]
-        print(f"\n{'─' * 95}")
+        print(f"\n{'─' * 80}")
         print(f"  {name}: E={num_experts}, topk={topk}, unit_size={unit_size}, model_dim={model_dim}")
-        print(f"{'─' * 95}")
+        print(f"{'─' * 80}")
         header = f"  {'T':>6s} {'Path':>6s} {'OPUS':>8s} {'FlyDSL':>8s} {'vs OPUS':>9s}"
-        if include_ck:
-            header += f" {'CK':>8s}"
         if not args.skip_check:
             header += f" {'check':>6s}"
         print(header)
         sep = f"  {'─' * 6} {'─' * 6} {'─' * 8} {'─' * 8} {'─' * 9}"
-        if include_ck:
-            sep += f" {'─' * 8}"
         if not args.skip_check:
             sep += f" {'─' * 6}"
         print(sep)
@@ -430,15 +398,7 @@ def main() -> int:
             if not args.skip_check:
                 try:
                     verify_correctness(
-                        ids,
-                        weights,
-                        num_experts,
-                        unit_size,
-                        m,
-                        topk,
-                        model_dim,
-                        device,
-                        check_ck=include_ck,
+                        ids, weights, num_experts, unit_size, m, topk, model_dim, device
                     )
                     n_ok += 1
                 except Exception as exc:
@@ -462,15 +422,6 @@ def main() -> int:
                 print(f"  FlyDSL failed at T={m}: {exc}", file=sys.stderr)
                 t_fl = None
 
-            t_ck = None
-            if include_ck:
-                try:
-                    t_ck = bench_ck(
-                        ids, weights, num_experts, unit_size, m, topk, model_dim, device, use_graph
-                    )
-                except Exception:
-                    t_ck = None
-
             op_s = f"{t_op:>8.1f}" if t_op is not None else f"{'N/A':>8s}"
             fl_s = f"{t_fl:>8.1f}" if t_fl is not None else f"{'N/A':>8s}"
             vs_op = (
@@ -479,9 +430,6 @@ def main() -> int:
                 else f"{'N/A':>9s}"
             )
             row = f"  {m:>6d} {path:>6s} {op_s} {fl_s} {vs_op}"
-            if include_ck:
-                ck_s = f"{t_ck:>8.1f}" if t_ck is not None else f"{'N/A':>8s}"
-                row += f" {ck_s}"
             if not args.skip_check:
                 row += f" {check_status:>6s}"
             print(row)
@@ -489,7 +437,7 @@ def main() -> int:
         if not args.skip_check:
             print(f"  correctness: {n_ok}/{len(T_ALL)} passed")
 
-    print(f"\n{'=' * 95}")
+    print(f"\n{'=' * 80}")
     return 0
 
 
