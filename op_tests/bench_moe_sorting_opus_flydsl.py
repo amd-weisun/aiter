@@ -26,6 +26,7 @@ Optional flags:
   --kineto-log            # full aiter-style profiler table (very verbose)
   --kineto-iters N        # profiler iterations (default: 21)
   --kineto-warmup N       # warmup before profile (default: 2)
+  --tokens T [T ...]      # subset of T values (default: full sweep)
 """
 
 from __future__ import annotations
@@ -561,7 +562,25 @@ def main() -> int:
         help="profiler iterations (default: 21; use 101 to match run_perftest)",
     )
     parser.add_argument("--kineto-warmup", type=int, default=2, help="warmup before profile")
+    parser.add_argument(
+        "--tokens",
+        nargs="+",
+        type=int,
+        metavar="T",
+        help=f"token counts to run (default: all {T_ALL})",
+    )
     args = parser.parse_args()
+
+    if args.tokens is not None:
+        token_list = []
+        for t in args.tokens:
+            if t not in T_ALL:
+                print(f"unknown T={t}; allowed: {T_ALL}", file=sys.stderr)
+                return 1
+            token_list.append(t)
+        args.tokens = token_list
+    else:
+        args.tokens = T_ALL
 
     if args.kineto_iters < 2:
         print("--kineto-iters must be >= 2", file=sys.stderr)
@@ -612,7 +631,7 @@ def main() -> int:
         print(sep)
 
         n_ok = 0
-        for m in T_ALL:
+        for m in args.tokens:
             torch.manual_seed(42)
             ids, weights = make_sorting_inputs(m, num_experts, topk, model_dim, dtype, device)
             use_graph = args.timing == "micro" and m <= 256
