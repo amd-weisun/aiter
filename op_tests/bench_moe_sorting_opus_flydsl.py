@@ -6,9 +6,9 @@
 Temporary script for PR review (prepare branch only). Sweeps token counts
 1..16384 for production configs requested by reviewers (DeepSeek-V4, GPT-OSS).
 
-Before timing each (config, T) point, runs all backends once and verifies
-each against the CPU reference (same rules as op_tests/test_moe_sorting).
-CK and OPUS are not required to match each other bitwise.
+Before timing each (config, T) point, runs all backends once. OPUS and FlyDSL
+are each checked vs the CPU reference and FlyDSL is checked directly vs OPUS.
+CK is checked vs CPU only (CK vs OPUS bitwise match is not required).
 
 Run from the aiter repo root on a GPU node, e.g. inside atom_bench:
   cd /path/to/aiter
@@ -284,7 +284,54 @@ def verify_against_native(
         )
 
 
-def verify_correctness(
+def verify_gpu_pair(
+    ref_out: SortingOutputs,
+    cand_out: SortingOutputs,
+    native_out: NativeOutputs,
+    *,
+    topk: int,
+    m: int,
+    ref_name: str,
+    cand_name: str,
+) -> None:
+    """Direct GPU-vs-GPU check using masks from the CPU reference."""
+    native_ids, native_weights, native_expert_ids, native_nv = native_out
+    ref_ids, ref_weights, ref_expert_ids, ref_nv, _ = ref_out
+    cand_ids, cand_weights, cand_expert_ids, cand_nv, _ = cand_out
+
+    errs: dict[str, float] = {}
+    errs["num_valid_ids"] = checkAllclose(
+        ref_nv, cand_nv, atol=0, msg=f"{cand_name} vs {ref_name} num_valid_ids", printLog=False
+    )
+    weight_mask = native_ids != (topk << 24 | m)
+    num_tokens_post_pad = native_nv[0].item()
+    errs["sorted_ids"] = checkAllclose(
+        ref_ids[:num_tokens_post_pad],
+        cand_ids[:num_tokens_post_pad],
+        msg=f"{cand_name} vs {ref_name} sorted_ids",
+        printLog=False,
+    )
+    errs["sorted_weights"] = checkAllclose(
+        ref_weights[weight_mask],
+        cand_weights[weight_mask],
+        msg=f"{cand_name} vs {ref_name} sorted_weights",
+        printLog=False,
+    )
+    expert_mask = native_expert_ids != -1
+    errs["sorted_expert_ids"] = checkAllclose(
+        ref_expert_ids[expert_mask],
+        cand_expert_ids[expert_mask],
+        msg=f"{cand_name} vs {ref_name} sorted_expert_ids",
+        printLog=False,
+    )
+    bad = {k: v for k, v in errs.items() if v}
+    if bad:
+        raise RuntimeError(
+            f"{cand_name} vs {ref_name} mismatch at M={m}, topk={topk}: "
+            f"mismatch fractions {bad}"
+        )
+
+
     ids,
     weights,
     num_experts,
@@ -303,6 +350,9 @@ def verify_correctness(
 
     verify_against_native(native_out, opus_out, topk=topk, m=m, backend_name="OPUS")
     verify_against_native(native_out, flydsl_out, topk=topk, m=m, backend_name="FlyDSL")
+    verify_gpu_pair(
+        opus_out, flydsl_out, native_out, topk=topk, m=m, ref_name="OPUS", cand_name="FlyDSL"
+    )
 
     if check_ck:
         ck_out = run_ck(ids, weights, num_experts, unit_size, m, topk, model_dim, device)
@@ -344,7 +394,7 @@ def main() -> int:
     if args.skip_check:
         print("  Correctness: SKIPPED (--skip-check)")
     else:
-        print("  Correctness: OPUS + FlyDSL (+ CK) vs CPU reference before each T")
+        print("  Correctness: OPUS + FlyDSL vs CPU; FlyDSL vs OPUS; CK vs CPU")
     print("=" * 95)
 
     include_ck = not args.no_ck
