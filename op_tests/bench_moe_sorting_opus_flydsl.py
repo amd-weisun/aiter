@@ -7,7 +7,8 @@ Temporary script for PR review (prepare branch only). Sweeps token counts
 1..16384 for production configs requested by reviewers (DeepSeek-V4, GPT-OSS).
 
 Before timing each (config, T) point, runs all backends once and verifies
-FlyDSL matches OPUS and CK (and OPUS matches CK).
+each against the CPU reference (same rules as op_tests/test_moe_sorting).
+CK and OPUS are not required to match each other bitwise.
 
 Run from the aiter repo root on a GPU node, e.g. inside atom_bench:
   cd /path/to/aiter
@@ -31,6 +32,8 @@ os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
 import torch
 
 import aiter
+from aiter import dtypes
+from aiter.test_common import checkAllclose
 from aiter.ops.flydsl.kernels.moe_sorting_kernel import (
     moe_sorting_flydsl,
     moe_sorting_get_workspace_size,
@@ -48,9 +51,69 @@ CONFIGS = {
     "dsv4": ("DeepSeek-V4", 385, 7, 32, 7168),
 }
 
+BLOCK_SIZE_M = 32
+
+NativeOutputs = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 SortingOutputs = tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]
+
+
+def moe_sorting_native(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_experts: int,
+    block_size: int = BLOCK_SIZE_M,
+    expert_mask=None,
+    num_local_tokens=None,
+) -> NativeOutputs:
+    """PyTorch reference implementation (mirrors op_tests/test_moe_sorting.py)."""
+    device = topk_ids.device
+    m, topk = topk_ids.shape
+    max_num_tokens_padded = topk_ids.numel() + num_experts * block_size - topk
+    max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+    init_val = topk << 24 | m
+    sorted_ids = torch.full(
+        (max_num_tokens_padded,), init_val, dtype=dtypes.i32, device=device
+    )
+    sorted_weights = torch.empty(
+        (max_num_tokens_padded,), dtype=dtypes.fp32, device=device
+    )
+    sorted_expert_ids = torch.full(
+        (max_num_m_blocks,), -1, dtype=dtypes.i32, device=device
+    )
+    num_tokens_post_pad = torch.empty((2), dtype=dtypes.i32, device=device)
+
+    if num_local_tokens is not None:
+        topk_ids = topk_ids[: num_local_tokens.item()]
+
+    sorted_ids_begin = 0
+    sorted_expert_ids_begin = 0
+    skip_expert_num = 0
+    for expert_id in range(num_experts):
+        if expert_mask is not None and expert_mask[expert_id] == 0:
+            skip_expert_num += 1
+            continue
+        token_id, topk_id = torch.where(topk_ids == expert_id)
+        tokens_num = token_id.numel()
+        sorted_expert_ids_num = (tokens_num + block_size - 1) // block_size
+        tokens_num_pad = sorted_expert_ids_num * block_size
+        sorted_ids[sorted_ids_begin : sorted_ids_begin + tokens_num] = (
+            topk_id << 24 | token_id
+        )
+        sorted_weights[sorted_ids_begin : sorted_ids_begin + tokens_num] = topk_weights[
+            token_id, topk_id
+        ]
+        sorted_ids_begin = sorted_ids_begin + tokens_num_pad
+        sorted_expert_ids[
+            sorted_expert_ids_begin : sorted_expert_ids_begin + sorted_expert_ids_num
+        ] = (expert_id - skip_expert_num)
+        sorted_expert_ids_begin = sorted_expert_ids_begin + sorted_expert_ids_num
+
+    num_tokens_post_pad[0] = sorted_ids_begin
+    num_tokens_post_pad[1] = topk_ids.shape[0]
+
+    return sorted_ids, sorted_weights, sorted_expert_ids, num_tokens_post_pad
 
 
 def make_unique_ids(m: int, topk: int, num_experts: int, device: torch.device) -> torch.Tensor:
@@ -172,42 +235,52 @@ def bench_ck(ids, weights, num_experts, unit_size, m, topk, model_dim, device, u
     return _bench(_run, use_graph)
 
 
-def compare_sorting_outputs(
-    ref: SortingOutputs,
-    cand: SortingOutputs,
+def verify_against_native(
+    native_out: NativeOutputs,
+    gpu_out: SortingOutputs,
     *,
     topk: int,
     m: int,
-    ref_name: str,
-    cand_name: str,
+    backend_name: str,
 ) -> None:
-    """Raise if candidate outputs differ from reference (same rules as op_tests/test_moe_sorting)."""
-    ref_ids, ref_weights, ref_expert_ids, ref_nv, _ = ref
-    cand_ids, cand_weights, cand_expert_ids, cand_nv, _ = cand
+    """Same field masks and tolerances as op_tests/test_moe_sorting.py."""
+    ref_ids, ref_weights, ref_expert_ids, ref_nv = native_out
+    gpu_ids, gpu_weights, gpu_expert_ids, gpu_nv, _ = gpu_out
 
-    mismatches: list[str] = []
-
-    if not torch.equal(ref_nv, cand_nv):
-        mismatches.append(
-            f"num_valid_ids: {ref_name}={ref_nv.tolist()} vs {cand_name}={cand_nv.tolist()}"
-        )
-
+    errs: dict[str, float] = {}
+    errs["num_tokens_post_padded"] = checkAllclose(
+        ref_nv,
+        gpu_nv,
+        atol=0,
+        msg=f"{backend_name} num_tokens_post_padded",
+        printLog=False,
+    )
+    weight_mask = ref_ids != (topk << 24 | m)
     num_tokens_post_pad = ref_nv[0].item()
-    if not torch.equal(ref_ids[:num_tokens_post_pad], cand_ids[:num_tokens_post_pad]):
-        mismatches.append("sorted_ids")
-
-    pad_sentinel = (topk << 24) | m
-    weight_mask = ref_ids != pad_sentinel
-    if not torch.equal(ref_weights[weight_mask], cand_weights[weight_mask]):
-        mismatches.append("sorted_weights")
-
+    errs["sorted_ids"] = checkAllclose(
+        ref_ids[:num_tokens_post_pad],
+        gpu_ids[:num_tokens_post_pad],
+        msg=f"{backend_name} sorted_ids",
+        printLog=False,
+    )
+    errs["sorted_weights"] = checkAllclose(
+        ref_weights[weight_mask],
+        gpu_weights[weight_mask],
+        msg=f"{backend_name} sorted_weights",
+        printLog=False,
+    )
     expert_mask = ref_expert_ids != -1
-    if not torch.equal(ref_expert_ids[expert_mask], cand_expert_ids[expert_mask]):
-        mismatches.append("sorted_expert_ids")
-
-    if mismatches:
+    errs["sorted_expert_ids"] = checkAllclose(
+        ref_expert_ids[expert_mask],
+        gpu_expert_ids[expert_mask],
+        msg=f"{backend_name} sorted_expert_ids",
+        printLog=False,
+    )
+    bad = {k: v for k, v in errs.items() if v}
+    if bad:
         raise RuntimeError(
-            f"{cand_name} vs {ref_name} mismatch at M={m}, topk={topk}: {', '.join(mismatches)}"
+            f"{backend_name} mismatch vs CPU reference at M={m}, topk={topk}: "
+            f"mismatch fractions {bad}"
         )
 
 
@@ -220,21 +293,20 @@ def verify_correctness(
     topk,
     model_dim,
     device,
+    *,
+    check_ck: bool,
 ) -> None:
-    """Run OPUS, CK, FlyDSL once and verify all three agree."""
+    """Run CPU reference + GPU backends; each GPU backend checked vs CPU."""
+    native_out = moe_sorting_native(ids, weights, num_experts, unit_size)
     opus_out = run_opus(ids, weights, num_experts, unit_size, m, topk, model_dim, device)
-    ck_out = run_ck(ids, weights, num_experts, unit_size, m, topk, model_dim, device)
     flydsl_out = run_flydsl(ids, weights, num_experts, unit_size, m, topk, model_dim, device)
 
-    compare_sorting_outputs(
-        opus_out, ck_out, topk=topk, m=m, ref_name="OPUS", cand_name="CK"
-    )
-    compare_sorting_outputs(
-        opus_out, flydsl_out, topk=topk, m=m, ref_name="OPUS", cand_name="FlyDSL"
-    )
-    compare_sorting_outputs(
-        ck_out, flydsl_out, topk=topk, m=m, ref_name="CK", cand_name="FlyDSL"
-    )
+    verify_against_native(native_out, opus_out, topk=topk, m=m, backend_name="OPUS")
+    verify_against_native(native_out, flydsl_out, topk=topk, m=m, backend_name="FlyDSL")
+
+    if check_ck:
+        ck_out = run_ck(ids, weights, num_experts, unit_size, m, topk, model_dim, device)
+        verify_against_native(native_out, ck_out, topk=topk, m=m, backend_name="CK")
 
 
 def main() -> int:
@@ -272,7 +344,7 @@ def main() -> int:
     if args.skip_check:
         print("  Correctness: SKIPPED (--skip-check)")
     else:
-        print("  Correctness: FlyDSL vs OPUS vs CK before each T")
+        print("  Correctness: OPUS + FlyDSL (+ CK) vs CPU reference before each T")
     print("=" * 95)
 
     include_ck = not args.no_ck
@@ -307,7 +379,15 @@ def main() -> int:
             if not args.skip_check:
                 try:
                     verify_correctness(
-                        ids, weights, num_experts, unit_size, m, topk, model_dim, device
+                        ids,
+                        weights,
+                        num_experts,
+                        unit_size,
+                        m,
+                        topk,
+                        model_dim,
+                        device,
+                        check_ck=include_ck,
                     )
                     n_ok += 1
                 except Exception as exc:
