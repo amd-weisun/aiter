@@ -17,15 +17,15 @@ Run from the aiter repo root on a GPU node, e.g. inside atom_bench:
 
 Timing modes (--timing):
   micro  — direct kernel calls; CUDA graph (T<=256) or events (T>256) [default]
-  kineto — moe_sorting() dispatch + PyTorch profiler (aiter run_perftest style);
-           set AITER_LOG_MORE=1 for the per-kernel table in logs
+  kineto — moe_sorting() dispatch + PyTorch profiler (quiet by default)
 
 Optional flags:
   --configs dsv4 gptoss   # subset of model configs (default: both)
   --skip-check            # skip correctness checks (timing only)
-  --kineto-detail         # print per-kernel device_time_avg (kineto mode only)
-  --kineto-iters N        # profiler iterations (default: 101, same as run_perftest)
-  --kineto-warmup N       # warmup iterations before profile (default: 2)
+  --kineto-detail         # one-line per-kernel breakdown per (backend, T)
+  --kineto-log            # full aiter-style profiler table (very verbose)
+  --kineto-iters N        # profiler iterations (default: 21)
+  --kineto-warmup N       # warmup before profile (default: 2)
 """
 
 from __future__ import annotations
@@ -35,6 +35,8 @@ import copy
 import os
 import re
 import sys
+import warnings
+from contextlib import contextmanager
 
 os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
 
@@ -250,7 +252,31 @@ def _print_kineto_sort_kernels(df: pd.DataFrame, backend: str, m: int) -> None:
         hits = cuda
     print(f"    kineto kernels ({backend}, T={m}):")
     for _, row in hits.iterrows():
-        print(f"      {row['device_time_avg']:8.1f} us  {row['name']}")
+        name = str(row["name"])
+        if len(name) > 72:
+            name = name[:69] + "..."
+        print(f"      {row['device_time_avg']:8.1f} us  {name}")
+
+
+def _print_kineto_full_table(df: pd.DataFrame, backend: str, m: int) -> None:
+    pd.set_option("display.expand_frame_repr", False)
+    pd.set_option("display.max_colwidth", 72)
+    pd.set_option("display.float_format", "{:,.1f}".format)
+    print(f"\n    kineto table ({backend}, T={m}):\n{df.to_string()}\n")
+
+
+@contextmanager
+def _suppress_aiter_log_more():
+    """Keep post_process_data quiet unless user opted into --kineto-log."""
+    prev = os.environ.get("AITER_LOG_MORE")
+    os.environ["AITER_LOG_MORE"] = "0"
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("AITER_LOG_MORE", None)
+        else:
+            os.environ["AITER_LOG_MORE"] = prev
 
 
 def bench_kineto_moe_sorting(
@@ -265,8 +291,9 @@ def bench_kineto_moe_sorting(
     num_iters: int,
     num_warmup: int,
     show_detail: bool,
+    show_log: bool,
 ) -> float:
-    """Profile moe_sorting() via kineto (aiter run_perftest / AITER_LOG_MORE pattern)."""
+    """Profile moe_sorting() via kineto (aiter run_perftest aggregation)."""
     set_moe_sorting_backend(backend)
     args = (
         topk_ids,
@@ -282,21 +309,25 @@ def bench_kineto_moe_sorting(
     rotate_args = [(copy.deepcopy(args), {}) for _ in range(num_iters - 1)] + [(args, {})]
     run_iters(num_warmup, moe_sorting, *args)
     torch.cuda.synchronize()
-    with tpf.profile(
-        activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
-        profile_memory=False,
-        with_stack=False,
-        with_modules=True,
-    ) as prof:
-        run_iters_rotate(num_iters, moe_sorting, rotate_args)
-        torch.cuda.synchronize()
-    total_us, df = get_trace_perf_table(prof, num_iters)
-    if int(os.environ.get("AITER_LOG_MORE", 0)):
-        pd.set_option("display.expand_frame_repr", False)
-        pd.set_option("display.max_colwidth", 90)
-        pd.set_option("display.float_format", "{:,.1f}".format)
-        aiter.logger.info("%s kineto trace (T=%d):\n%s", backend, topk_ids.shape[0], df)
-    if show_detail:
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=".*Profiler clears events at the end of each cycle.*",
+            category=UserWarning,
+        )
+        with tpf.profile(
+            activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
+            profile_memory=False,
+            with_stack=False,
+            with_modules=True,
+        ) as prof:
+            run_iters_rotate(num_iters, moe_sorting, rotate_args)
+            torch.cuda.synchronize()
+        with _suppress_aiter_log_more():
+            total_us, df = get_trace_perf_table(prof, num_iters)
+    if show_log:
+        _print_kineto_full_table(df, backend, topk_ids.shape[0])
+    elif show_detail:
         _print_kineto_sort_kernels(df, backend, topk_ids.shape[0])
     return total_us
 
@@ -516,9 +547,19 @@ def main() -> int:
     parser.add_argument(
         "--kineto-detail",
         action="store_true",
-        help="print per-kernel device_time_avg breakdown (kineto mode only)",
+        help="print compact per-kernel device_time_avg (kineto mode only)",
     )
-    parser.add_argument("--kineto-iters", type=int, default=101, help="profiler iterations")
+    parser.add_argument(
+        "--kineto-log",
+        action="store_true",
+        help="print full profiler table per (backend, T); very verbose",
+    )
+    parser.add_argument(
+        "--kineto-iters",
+        type=int,
+        default=21,
+        help="profiler iterations (default: 21; use 101 to match run_perftest)",
+    )
     parser.add_argument("--kineto-warmup", type=int, default=2, help="warmup before profile")
     args = parser.parse_args()
 
@@ -534,8 +575,8 @@ def main() -> int:
         print("CUDA is required.", file=sys.stderr)
         return 1
 
-    if args.timing == "kineto":
-        os.environ["AITER_LOG_MORE"] = os.environ.get("AITER_LOG_MORE", "1")
+    if args.timing == "kineto" and args.kineto_log:
+        os.environ["AITER_LOG_MORE"] = "1"
 
     dtype = dtypes.d_dtypes["bf16"]
     device = torch.device("cuda:0")
@@ -548,7 +589,7 @@ def main() -> int:
     else:
         print(
             f"  Timing: kineto — moe_sorting() + profiler "
-            f"({args.kineto_warmup} warmup, {args.kineto_iters} iters, AITER_LOG_MORE=1)"
+            f"({args.kineto_warmup} warmup, {args.kineto_iters} iters, quiet output)"
         )
     if args.skip_check:
         print("  Correctness: SKIPPED (--skip-check)")
@@ -601,6 +642,7 @@ def main() -> int:
                         num_iters=args.kineto_iters,
                         num_warmup=args.kineto_warmup,
                         show_detail=args.kineto_detail,
+                        show_log=args.kineto_log,
                     )
                 else:
                     t_op = bench_opus_micro(
@@ -623,6 +665,7 @@ def main() -> int:
                         num_iters=args.kineto_iters,
                         num_warmup=args.kineto_warmup,
                         show_detail=args.kineto_detail,
+                        show_log=args.kineto_log,
                     )
                 else:
                     t_fl = bench_flydsl_micro(
