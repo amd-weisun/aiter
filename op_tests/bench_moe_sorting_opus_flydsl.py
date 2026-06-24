@@ -69,7 +69,8 @@ CONFIGS = {
 
 BLOCK_SIZE_M = 32
 SORT_KERNEL_RE = re.compile(
-    r"moe.?sort|sorting|opus|flydsl|p0v2|p23|decode|scatter|multiphase|clear.?ws|clear_workspace",
+    r"moe.?sort|sorting|opus|flydsl|p0v2|p0_scatter|p1_count|p23|count_kernel|"
+    r"decode|scatter|multiphase|clear.?ws|clear_workspace",
     re.IGNORECASE,
 )
 

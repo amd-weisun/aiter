@@ -1399,7 +1399,10 @@ def _compile_moe_sorting_multiphase(
     # Parallel design (matching CK P23): each block [0, E) independently
     # computes the SAME prefix sum, then scatters ONLY for expert blockIdx.x.
     # No inter-block barrier needed — redundant prefix sums are deterministic.
-    K4_BLOCK = 256 if E <= 256 else 512
+    # Match OPUS P23 kBlockSize=256. Serial prefix-sum / local-idx extension
+    # handles E > 256 (e.g. DSV4 E=385). A 512-thread block halves mesh-scan
+    # iterations but reduces occupancy and diverged from OPUS at large T.
+    K4_BLOCK = 256
 
     # LDS: cumsum[E+1] for prefix sums + cross-wave scratch for DPP scan
     K4_NUM_WAVES = K4_BLOCK // WARP_SIZE
