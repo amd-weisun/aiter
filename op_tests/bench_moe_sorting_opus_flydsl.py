@@ -6,6 +6,9 @@
 Temporary script for PR review (prepare branch only). Sweeps token counts
 1..16384 for production configs requested by reviewers (DeepSeek-V4, GPT-OSS).
 
+Before timing each (config, T) point, runs all backends once and verifies
+FlyDSL matches OPUS and CK (and OPUS matches CK).
+
 Run from the aiter repo root on a GPU node, e.g. inside atom_bench:
   cd /path/to/aiter
   FLYDSL_RUNTIME_ENABLE_CACHE=0 HIP_VISIBLE_DEVICES=0 \\
@@ -13,8 +16,8 @@ Run from the aiter repo root on a GPU node, e.g. inside atom_bench:
 
 Optional flags:
   --configs dsv4 gptoss   # subset of model configs (default: both)
-  --check                 # verify FlyDSL outputs match OPUS before timing
-  --no-ck                 # skip CK column (default includes CK when available)
+  --skip-check            # skip correctness checks (timing only)
+  --no-ck                 # skip CK timing column (correctness still uses CK unless --skip-check)
 """
 
 from __future__ import annotations
@@ -44,6 +47,10 @@ CONFIGS = {
     "gptoss": ("GPT-OSS", 40, 6, 128, 5120),
     "dsv4": ("DeepSeek-V4", 385, 7, 32, 7168),
 }
+
+SortingOutputs = tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]
 
 
 def make_unique_ids(m: int, topk: int, num_experts: int, device: torch.device) -> torch.Tensor:
@@ -165,15 +172,69 @@ def bench_ck(ids, weights, num_experts, unit_size, m, topk, model_dim, device, u
     return _bench(_run, use_graph)
 
 
-def check_outputs(opus_out, flydsl_out, m: int) -> None:
-    for name, o, f in [
-        ("sorted_ids", opus_out[0], flydsl_out[0]),
-        ("sorted_weights", opus_out[1], flydsl_out[1]),
-        ("sorted_expert_ids", opus_out[2], flydsl_out[2]),
-        ("num_valid_ids", opus_out[3], flydsl_out[3]),
-    ]:
-        if not torch.equal(o, f):
-            raise RuntimeError(f"{name} mismatch at M={m}")
+def compare_sorting_outputs(
+    ref: SortingOutputs,
+    cand: SortingOutputs,
+    *,
+    topk: int,
+    m: int,
+    ref_name: str,
+    cand_name: str,
+) -> None:
+    """Raise if candidate outputs differ from reference (same rules as op_tests/test_moe_sorting)."""
+    ref_ids, ref_weights, ref_expert_ids, ref_nv, _ = ref
+    cand_ids, cand_weights, cand_expert_ids, cand_nv, _ = cand
+
+    mismatches: list[str] = []
+
+    if not torch.equal(ref_nv, cand_nv):
+        mismatches.append(
+            f"num_valid_ids: {ref_name}={ref_nv.tolist()} vs {cand_name}={cand_nv.tolist()}"
+        )
+
+    num_tokens_post_pad = ref_nv[0].item()
+    if not torch.equal(ref_ids[:num_tokens_post_pad], cand_ids[:num_tokens_post_pad]):
+        mismatches.append("sorted_ids")
+
+    pad_sentinel = (topk << 24) | m
+    weight_mask = ref_ids != pad_sentinel
+    if not torch.equal(ref_weights[weight_mask], cand_weights[weight_mask]):
+        mismatches.append("sorted_weights")
+
+    expert_mask = ref_expert_ids != -1
+    if not torch.equal(ref_expert_ids[expert_mask], cand_expert_ids[expert_mask]):
+        mismatches.append("sorted_expert_ids")
+
+    if mismatches:
+        raise RuntimeError(
+            f"{cand_name} vs {ref_name} mismatch at M={m}, topk={topk}: {', '.join(mismatches)}"
+        )
+
+
+def verify_correctness(
+    ids,
+    weights,
+    num_experts,
+    unit_size,
+    m,
+    topk,
+    model_dim,
+    device,
+) -> None:
+    """Run OPUS, CK, FlyDSL once and verify all three agree."""
+    opus_out = run_opus(ids, weights, num_experts, unit_size, m, topk, model_dim, device)
+    ck_out = run_ck(ids, weights, num_experts, unit_size, m, topk, model_dim, device)
+    flydsl_out = run_flydsl(ids, weights, num_experts, unit_size, m, topk, model_dim, device)
+
+    compare_sorting_outputs(
+        opus_out, ck_out, topk=topk, m=m, ref_name="OPUS", cand_name="CK"
+    )
+    compare_sorting_outputs(
+        opus_out, flydsl_out, topk=topk, m=m, ref_name="OPUS", cand_name="FlyDSL"
+    )
+    compare_sorting_outputs(
+        ck_out, flydsl_out, topk=topk, m=m, ref_name="CK", cand_name="FlyDSL"
+    )
 
 
 def main() -> int:
@@ -186,9 +247,9 @@ def main() -> int:
         help="model configs to benchmark (default: all)",
     )
     parser.add_argument(
-        "--check",
+        "--skip-check",
         action="store_true",
-        help="verify FlyDSL outputs match OPUS before timing each token count",
+        help="skip correctness checks and run timing only",
     )
     parser.add_argument("--no-ck", action="store_true", help="skip CK timing column")
     args = parser.parse_args()
@@ -208,6 +269,10 @@ def main() -> int:
     print("  MoE Sorting UT Benchmark — OPUS vs FlyDSL")
     print(f"  Decode (T<=256): CUDA graph, {GRAPH_REPLAY} replays")
     print(f"  Prefill (T>256): CUDA events, {BENCH} iterations")
+    if args.skip_check:
+        print("  Correctness: SKIPPED (--skip-check)")
+    else:
+        print("  Correctness: FlyDSL vs OPUS vs CK before each T")
     print("=" * 95)
 
     include_ck = not args.no_ck
@@ -220,9 +285,17 @@ def main() -> int:
         header = f"  {'T':>6s} {'Path':>6s} {'OPUS':>8s} {'FlyDSL':>8s} {'vs OPUS':>9s}"
         if include_ck:
             header += f" {'CK':>8s}"
+        if not args.skip_check:
+            header += f" {'check':>6s}"
         print(header)
-        print(f"  {'─' * 6} {'─' * 6} {'─' * 8} {'─' * 8} {'─' * 9}" + (f" {'─' * 8}" if include_ck else ""))
+        sep = f"  {'─' * 6} {'─' * 6} {'─' * 8} {'─' * 8} {'─' * 9}"
+        if include_ck:
+            sep += f" {'─' * 8}"
+        if not args.skip_check:
+            sep += f" {'─' * 6}"
+        print(sep)
 
+        n_ok = 0
         for m in T_ALL:
             torch.manual_seed(42)
             ids = make_unique_ids(m, topk, num_experts, device)
@@ -230,12 +303,17 @@ def main() -> int:
             use_graph = m <= 256
             path = "graph" if use_graph else "eager"
 
-            if args.check:
-                opus_out = run_opus(ids, weights, num_experts, unit_size, m, topk, model_dim, device)
-                flydsl_out = run_flydsl(
-                    ids, weights, num_experts, unit_size, m, topk, model_dim, device
-                )
-                check_outputs(opus_out, flydsl_out, m)
+            check_status = "ok"
+            if not args.skip_check:
+                try:
+                    verify_correctness(
+                        ids, weights, num_experts, unit_size, m, topk, model_dim, device
+                    )
+                    n_ok += 1
+                except Exception as exc:
+                    check_status = "FAIL"
+                    print(f"  correctness failed at T={m}: {exc}", file=sys.stderr)
+                    return 1
 
             try:
                 t_op = bench_opus(
@@ -273,7 +351,12 @@ def main() -> int:
             if include_ck:
                 ck_s = f"{t_ck:>8.1f}" if t_ck is not None else f"{'N/A':>8s}"
                 row += f" {ck_s}"
+            if not args.skip_check:
+                row += f" {check_status:>6s}"
             print(row)
+
+        if not args.skip_check:
+            print(f"  correctness: {n_ok}/{len(T_ALL)} passed")
 
     print(f"\n{'=' * 95}")
     return 0
