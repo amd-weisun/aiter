@@ -332,6 +332,7 @@ def verify_gpu_pair(
         )
 
 
+def verify_correctness(
     ids,
     weights,
     num_experts,
