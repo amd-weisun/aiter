@@ -36,6 +36,12 @@ from aiter.dist.utils import env_flag
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.utility.dtypes import fp8
 
+from ._topology_guard import (
+    ALLOW_CROSS_SOCKET_PCIE_ENV,
+    cross_socket_pcie_reason,
+    device_bdf,
+    read_numa_node,
+)
 from .flydsl_backends import (
     FlyDSLAllReduceRMSNorm,
     all_ranks_agree,
@@ -1409,6 +1415,19 @@ class CustomAllreduce:
         assert isinstance(device, torch.device)
         self.device = device
 
+        # PCIe-only groups spanning CPU sockets: the cross-device kernels have
+        # hung the whole host there. xGMI, single-socket and unknown topologies
+        # are unaffected (see _topology_guard.py).
+        if world_size > 2 and not env_flag(ALLOW_CROSS_SOCKET_PCIE_ENV):
+            reason = self._cross_socket_pcie_reason(device)
+            if reason is not None:
+                logger.warning(
+                    "Custom allreduce is disabled: %s. Set %s=1 to override.",
+                    reason,
+                    ALLOW_CROSS_SOCKET_PCIE_ENV,
+                )
+                return
+
         # device_ids = get_cuda_visible_devices()
 
         # physical_device_id = device_ids[device.index]
@@ -2342,6 +2361,20 @@ class CustomAllreduce:
         if nbytes is None:
             return False
         return self._fly_window.contains(nbytes)
+
+    def _cross_socket_pcie_reason(self, device: torch.device) -> str | None:
+        """Gather every rank's PCI address and NUMA node and apply the topology
+        guard. All ranks get the same answer (disable if any rank says so)."""
+        try:
+            bdf = device_bdf(torch.cuda.get_device_properties(device))
+        except Exception:  # noqa: BLE001
+            bdf = None
+        topo = [None] * self.world_size
+        dist.all_gather_object(topo, (bdf, read_numa_node(bdf)), group=self.group)
+        reason = cross_socket_pcie_reason([t[0] for t in topo], [t[1] for t in topo])
+        votes = [None] * self.world_size
+        dist.all_gather_object(votes, reason, group=self.group)
+        return next((v for v in votes if v), None)
 
     def should_custom_ar(self, inp: torch.Tensor, prefill_support: bool = False):
         return self._fits_custom_ar_size(inp, prefill_support) and is_weak_contiguous(
